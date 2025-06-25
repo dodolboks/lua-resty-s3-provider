@@ -76,7 +76,7 @@ local PROVIDERS = {
 }
 
 local _M = new_tab(0, 100)
-_M._VERSION = '0.3.0'
+_M._VERSION = '0.3.1'
 
 local mt = { __index = _M }
 
