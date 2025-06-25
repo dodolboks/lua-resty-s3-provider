@@ -1,8 +1,8 @@
-local util = require "resty.s3_util"
-local s3_auth = require "resty.s3_auth"
+local util = require "resty.s3_provider_util"
+local s3_auth = require "resty.s3_provider_auth"
 local cjson = require "cjson"
-local xml = require "resty.s3_xml"
-local s3_multi_upload = require("resty.s3_multi_upload")
+local xml = require "resty.s3_provider_xml"
+local s3_multi_upload = require("resty.s3_provider_multi_upload")
 
 local ok, new_tab = pcall(require, "table.new")
 if not ok then

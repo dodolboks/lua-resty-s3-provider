@@ -1,9 +1,9 @@
-local util = require "resty.s3_util"
+local util = require "resty.s3_provider_util"
 local cjson = require "cjson"
-local xml = require "resty.s3_xml"
+local xml = require "resty.s3_provider_xml"
 
 local _M = {}
-_M._VERSION = '0.01'
+_M._VERSION = '0.4.0'
 
 local mt = { __index = _M }
 

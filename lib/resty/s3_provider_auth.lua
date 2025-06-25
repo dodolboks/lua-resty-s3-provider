@@ -1,5 +1,5 @@
-local sha2 = require "resty.s3_sha2"
-local util = require "resty.s3_util"
+local sha2 = require "resty.s3_provider_sha2"
+local util = require "resty.s3_provider_util"
 
 local NEW_LINE = "\n"
 
@@ -61,7 +61,7 @@ local function get_datetime()
 end
 
 local _M = new_tab(0, 100)
-_M._VERSION = '0.02'
+_M._VERSION = '0.4.0'
 
 local hmac_sha256 = util.hmac_sha256
 
