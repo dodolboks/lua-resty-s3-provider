@@ -1,12 +1,59 @@
 --[[
-author: jie123108@163.com
-date: 20150901
+author: jie123108@163.com (modified for S3 compatibility)
+date: 20150901 (updated for multi-provider S3 support)
 ]]
 
 local _M = {}
 local hmac = require "resty.hmac"
 local http = require "resty.http"   -- https://github.com/pintsized/lua-resty-http
 local cjson = require "cjson"
+
+-- S3 Provider configurations
+_M.S3_PROVIDERS = {
+    aws = {
+        endpoint_template = "https://s3.{region}.amazonaws.com",
+        default_region = "us-east-1",
+        supports_virtual_hosted = true,
+        supports_path_style = true
+    },
+    cloudflare_r2 = {
+        endpoint_template = "https://{account_id}.r2.cloudflarestorage.com",
+        default_region = "auto",
+        supports_virtual_hosted = false,
+        supports_path_style = true,
+        requires_account_id = true
+    },
+    linode = {
+        endpoint_template = "https://{region}.linodeobjects.com",
+        default_region = "us-east-1",
+        supports_virtual_hosted = true,
+        supports_path_style = true
+    },
+    digitalocean = {
+        endpoint_template = "https://{region}.digitaloceanspaces.com",
+        default_region = "nyc3",
+        supports_virtual_hosted = true,
+        supports_path_style = false
+    },
+    backblaze = {
+        endpoint_template = "https://s3.{region}.backblazeb2.com",
+        default_region = "us-west-002",
+        supports_virtual_hosted = false,
+        supports_path_style = true
+    },
+    wasabi = {
+        endpoint_template = "https://s3.{region}.wasabisys.com",
+        default_region = "us-east-1",
+        supports_virtual_hosted = true,
+        supports_path_style = true
+    },
+    custom = {
+        endpoint_template = "{custom_endpoint}",
+        default_region = "us-east-1",
+        supports_virtual_hosted = true,
+        supports_path_style = true
+    }
+}
 
 function _M.new_headers()
     local t = {}
@@ -22,7 +69,6 @@ function _M.new_headers()
      }
     return setmetatable(t, _mt)
 end
-
 
 function _M.trim (s)
     return (string.gsub(s, "^%s*(.-)%s*$", "%1"))
@@ -50,6 +96,113 @@ function _M.hmac_sha256(key, data, hex)
         hex = false
     end
     return hmac_sha256:final(data, hex)
+end
+
+-- S3 URL builder functions
+function _M.build_s3_endpoint(provider, config)
+    local provider_config = _M.S3_PROVIDERS[provider]
+    if not provider_config then
+        ngx.log(ngx.ERR, "Unknown S3 provider: ", provider)
+        return nil
+    end
+    
+    local endpoint = provider_config.endpoint_template
+    
+    if provider == "custom" then
+        if not config.custom_endpoint then
+            ngx.log(ngx.ERR, "Custom endpoint required for custom provider")
+            return nil
+        end
+        endpoint = config.custom_endpoint
+    else
+        -- Replace placeholders
+        local region = config.region or provider_config.default_region
+        endpoint = string.gsub(endpoint, "{region}", region)
+        
+        if provider_config.requires_account_id then
+            if not config.account_id then
+                ngx.log(ngx.ERR, "Account ID required for provider: ", provider)
+                return nil
+            end
+            endpoint = string.gsub(endpoint, "{account_id}", config.account_id)
+        end
+    end
+    
+    return endpoint
+end
+
+function _M.build_s3_url(provider, config, bucket, key, use_virtual_hosted)
+    local endpoint = _M.build_s3_endpoint(provider, config)
+    if not endpoint then
+        return nil
+    end
+    
+    local provider_config = _M.S3_PROVIDERS[provider]
+    
+    -- Determine URL style
+    local virtual_hosted = use_virtual_hosted
+    if virtual_hosted == nil then
+        virtual_hosted = provider_config.supports_virtual_hosted and config.use_virtual_hosted
+    end
+    
+    -- Force path style if provider doesn't support virtual hosted
+    if virtual_hosted and not provider_config.supports_virtual_hosted then
+        virtual_hosted = false
+        ngx.log(ngx.WARN, "Provider ", provider, " doesn't support virtual hosted style, using path style")
+    end
+    
+    local url
+    if virtual_hosted then
+        -- Virtual hosted style: https://bucket.s3.region.amazonaws.com/key
+        local host_parts = {}
+        table.insert(host_parts, bucket)
+        
+        -- Extract host from endpoint
+        local host = string.match(endpoint, "https?://([^/]+)")
+        if host then
+            table.insert(host_parts, host)
+            url = string.gsub(endpoint, host, table.concat(host_parts, "."))
+        else
+            -- Fallback to path style
+            url = endpoint .. "/" .. bucket
+        end
+    else
+        -- Path style: https://s3.region.amazonaws.com/bucket/key
+        url = endpoint .. "/" .. bucket
+    end
+    
+    if key and key ~= "" then
+        -- Ensure key doesn't start with /
+        if string.sub(key, 1, 1) == "/" then
+            key = string.sub(key, 2)
+        end
+        url = url .. "/" .. key
+    end
+    
+    return url
+end
+
+-- Enhanced URL validation for S3 endpoints
+function _M.validate_s3_bucket_name(bucket)
+    if not bucket or bucket == "" then
+        return false, "Bucket name cannot be empty"
+    end
+    
+    if string.len(bucket) < 3 or string.len(bucket) > 63 then
+        return false, "Bucket name must be between 3 and 63 characters"
+    end
+    
+    -- Check for valid characters and format
+    if not string.match(bucket, "^[a-z0-9][a-z0-9%-]*[a-z0-9]$") then
+        return false, "Bucket name contains invalid characters"
+    end
+    
+    -- Check for consecutive hyphens or periods
+    if string.find(bucket, "%-%-") or string.find(bucket, "%.%.") or string.find(bucket, "%-%.")  or string.find(bucket, "%.%-") then
+        return false, "Bucket name cannot contain consecutive hyphens or periods"
+    end
+    
+    return true
 end
 
 -- delimiter 应该是单个字符。如果是多个字符，表示以其中任意一个字符做分割。
@@ -155,9 +308,9 @@ function _M.dns_init()
     local resolv_file = "/etc/resolv.conf"
        
     ngx.log(ngx.INFO, "init dns from resolv_file:", resolv_file)
-    local dns_svr = {"8.8.8.8"}
+    local dns_svr = {"8.8.8.8", "1.1.1.1", "8.8.4.4"} -- Added Cloudflare DNS and Google secondary
     local resolvs = readresolv(resolv_file)
-    if resolvs then
+    if resolvs and #resolvs > 0 then
         dns_svr = resolvs
     end
 
@@ -194,10 +347,11 @@ function _M.dns_init()
     else
         table.insert(_M.nameservers, "8.8.8.8")
         table.insert(_M.nameservers, {"8.8.4.4", 53})
+        table.insert(_M.nameservers, {"1.1.1.1", 53})
         table.insert(_M.strnameservers, "8.8.8.8")
-        table.insert(_M.strnameservers, "8.8.8.4:53")
+        table.insert(_M.strnameservers, "8.8.4.4:53")
+        table.insert(_M.strnameservers, "1.1.1.1:53")
     end
-
 end
 
 function _M.is_ip(strip)
@@ -366,6 +520,8 @@ function _M.get_resolver_url(url)
     local xurl = url
     if string.sub(url, 1, 7) == "http://" then
         xurl = string.sub(url, 8)
+    elseif string.sub(url, 1, 8) == "https://" then
+        xurl = string.sub(url, 9)
     end
 
     -- print(xurl)
@@ -389,7 +545,12 @@ function _M.get_resolver_url(url)
             return nil, "dns query failed for host '" .. host .. "' "
         end
 
-        local addr_full = "http://" .. addr
+        local schema = "https://"
+        if string.sub(url, 1, 7) == "http://" then
+            schema = "http://"
+        end
+        
+        local addr_full = schema .. addr
         if rest then
             addr_full = addr_full .. rest
         end
@@ -434,10 +595,12 @@ local function http_req(method, uri, body, myheaders, timeout)
         local debug_body = nil
         local content_type = myheaders["Content-Type"]
         if content_type == nil or _M.startswith(content_type, "text") then 
-            if string.len(body) < 1024 then
+            if body and string.len(body) < 1024 then
                 debug_body = body
-            else
+            elseif body then
                 debug_body = string.sub(body, 1, 1024)
+            else
+                debug_body = ""
             end
         else 
             debug_body = "[[not text body: " .. tostring(content_type) .. "]]"
@@ -458,13 +621,12 @@ local function http_req(method, uri, body, myheaders, timeout)
     if not res then
         ngx.log(ngx.ERR, "FAIL REQUEST [ ",req_debug, " ] err:", err, ", cost:", cost)
     elseif res.status >= 400 and res.status ~= 404 then
-        ngx.log(ngx.ERR, "FAIL REQUEST [ ",req_debug, " ] status:", res.status, ", const:", cost)
+        ngx.log(ngx.ERR, "FAIL REQUEST [ ",req_debug, " ] status:", res.status, ", cost:", cost)
     else
-        ngx.log(ngx.INFO, "REQUEST [ ",req_debug, " ] status:", res.status, ", const:", cost)
+        ngx.log(ngx.INFO, "REQUEST [ ",req_debug, " ] status:", res.status, ", cost:", cost)
     end
     return res, err, req_debug
 end
-
 
 local function url_302_get(url)
     local s3_cache = ngx.shared.s3_cache
@@ -498,7 +660,6 @@ local function url_302_set(url, url_302, exptime)
         ngx.log(ngx.ERR , "s3_cache:set(", url, ",md5:", url_md5 , ",302_url: ",url_302, ",exptime:", exptime, ") failed! err:", err)
     end
 end
-
 
 --支持302的请求
 local function http_req_3xx(method, uri, body, myheaders, timeout)
@@ -577,6 +738,25 @@ end
 
 function _M.http_put(uri,  body, myheaders, timeout)
     return http_req_3xx("PUT", uri, body, myheaders, timeout)
+end
+
+-- S3 specific HTTP methods
+function _M.s3_request(method, provider, config, bucket, key, body, headers, timeout)
+    local url = _M.build_s3_url(provider, config, bucket, key)
+    if not url then
+        return nil, "Failed to build S3 URL"
+    end
+    
+    if not headers then
+        headers = _M.new_headers()
+    end
+    
+    -- Add S3-specific headers if not present
+    if not headers["User-Agent"] then
+        headers["User-Agent"] = "lua-resty-s3-compatible/1.0"
+    end
+    
+    return http_req_3xx(method, url, body, headers, timeout)
 end
 
 -- 尝试从/etc/resolv.conf读取dns配置(如果有配置)。
